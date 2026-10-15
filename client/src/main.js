@@ -3,7 +3,9 @@ import { gameAudio } from "./audio.js";
 import "./style.css";
 
 const app = document.querySelector("#app");
-const connection = io(import.meta.env.VITE_SERVER_URL || undefined, { autoConnect: false, reconnection: true });
+const multiplayerServerUrl = import.meta.env.VITE_SERVER_URL?.trim();
+const vercelFrontend = location.hostname.endsWith(".vercel.app");
+const connection = io(multiplayerServerUrl || undefined, { autoConnect: false, reconnection: true });
 const pendingRoom = new URLSearchParams(location.search).get("room");
 let myName = "";
 let currentRoom = null;
@@ -183,13 +185,18 @@ function getName() {
 }
 
 async function connect() {
+  if (vercelFrontend && !multiplayerServerUrl) {
+    throw new Error("Multiplayer server is not connected to this Vercel site yet. Set VITE_SERVER_URL to the Node game server URL in Vercel and redeploy.");
+  }
   if (connection.connected) return;
   await new Promise((resolve, reject) => {
+    const timeoutMs = multiplayerServerUrl?.includes(".onrender.com") ? 90000 : 12000;
     const timeout = setTimeout(() => {
       connection.off("connect", onConnect);
       connection.off("connect_error", onError);
-      reject(new Error("Could not reach the game server. Try again in a moment."));
-    }, 5000);
+      connection.disconnect();
+      reject(new Error("Could not reach the multiplayer server. Check its health page and try again."));
+    }, timeoutMs);
     const onConnect = () => {
       clearTimeout(timeout);
       connection.off("connect_error", onError);
@@ -211,6 +218,7 @@ async function createRoom() {
   if (!name) return;
   const button = document.querySelector("#create-room");
   button.disabled = true;
+  button.querySelector("span").textContent = "CONNECTING...";
   try {
     await connect();
     const settings = {
@@ -224,7 +232,10 @@ async function createRoom() {
   } catch (error) {
     showToast(error.message);
   } finally {
-    if (button.isConnected) button.disabled = false;
+    if (button.isConnected) {
+      button.disabled = false;
+      button.querySelector("span").textContent = "CREATE PRIVATE ROOM";
+    }
   }
 }
 
@@ -237,7 +248,10 @@ async function joinRoom() {
     return;
   }
   const button = document.querySelector("#join-room");
-  if (button) button.disabled = true;
+  if (button) {
+    button.disabled = true;
+    button.textContent = "WAIT";
+  }
   try {
     await connect();
     const response = await request("room:join", { name, code });
@@ -246,7 +260,10 @@ async function joinRoom() {
   } catch (error) {
     showToast(error.message);
   } finally {
-    if (button?.isConnected) button.disabled = false;
+    if (button?.isConnected) {
+      button.disabled = false;
+      button.textContent = "JOIN";
+    }
   }
 }
 

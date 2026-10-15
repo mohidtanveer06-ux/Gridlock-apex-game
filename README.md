@@ -28,6 +28,18 @@ To host the frontend separately from the persistent Node/WebSocket server:
 - Set `CLIENT_ORIGIN` on the server to the frontend origin (comma-separated if there are multiple).
 - Build the frontend with `npm run build` and run the server with `npm start`.
 
+### Deploy the multiplayer server on Render
+
+Vercel serves the web client, but its serverless deployment does not run this persistent Socket.IO game server. The `/socket.io/` endpoint on the Vercel site must connect to a separately hosted Node service.
+
+1. In Render, create a **Blueprint** from this GitHub repository and apply the included `render.yaml`. Wait for the `mt-gridlock-apex-server` web service to become live. Its health check is `/health`.
+2. Copy the service's public URL, such as `https://mt-gridlock-apex-server.onrender.com`.
+3. In Vercel, open the `grid-lock-apex` project's **Settings → Environment Variables**. Add `VITE_SERVER_URL` with that full HTTPS service URL for **Production**.
+4. Redeploy the Vercel project so Vite includes the server URL in the browser bundle.
+5. Test `https://<render-service-url>/health` (it should return `{"status":"ok","rooms":0}`), then create a room at `https://grid-lock-apex.vercel.app`.
+
+The Render blueprint permits the production Vercel origin with `CLIENT_ORIGIN`. If you use another Vercel domain, update that setting in Render to the exact browser origin. The blueprint uses Render's free plan; free web services can sleep when idle, so the first connection after inactivity may take longer. An always-on Render plan avoids the cold start.
+
 Copy `.env.example` to `.env` for local environment values. The Node server reads its environment from the hosting platform; Vite reads `VITE_` variables during the build.
 
 ## Match controls
