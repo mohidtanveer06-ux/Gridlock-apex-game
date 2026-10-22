@@ -24,12 +24,17 @@ const io = new Server(httpServer, {
 const PORT = Number(process.env.PORT) || 3000;
 const WORLD = { width: 960, height: 600, columns: 12, rows: 8, cell: 72, left: 48, top: 12 };
 const CORE = { x: 480, y: 300, radius: 62 };
-const ROOM_CAPACITIES = new Set([4, 6, 8]);
+const ROOM_CAPACITIES = new Set([4, 6, 8, 10]);
 const MATCH_DURATIONS = new Set([90, 120, 150, 180]);
 const CHAOS_LEVELS = new Set(["off", "chill", "standard", "wild"]);
 const CHAOS_INTERVALS = { chill: 90000, standard: 60000, wild: 45000 };
 const rooms = new Map();
 const ACTION_COOLDOWN = 900;
+const QUICK_PLAY_SETTINGS = { maxPlayers: 8, duration: 120, chaos: "standard" };
+const MIN_MATCH_PLAYERS = 2;
+const AUTO_START_MIN_PLAYERS = 3;
+const AUTO_START_DELAY = 12000;
+const RESULT_LINGER = 20000;
 const MAX_WALLS = 18;
 const ABILITY_COOLDOWNS = { Constructor: 22000, Glitcher: 8000 };
 const CORE_SHIELD_DURATION = 4000;
@@ -85,8 +90,23 @@ function publicRoom(room) {
     code: room.code,
     hostId: room.hostId,
     phase: room.phase,
+    isPublic: room.isPublic,
+    autoStartIn: room.autoStartAt ? Math.max(0, Math.ceil((room.autoStartAt - Date.now()) / 1000)) : null,
+    minPlayers: room.isPublic ? AUTO_START_MIN_PLAYERS : MIN_MATCH_PLAYERS,
     settings: room.settings,
     players: room.players.map(({ id, name, ready, role, score }) => ({ id, name, ready, role, score })),
+  };
+}
+
+function lobbySummary(room) {
+  return {
+    code: room.code,
+    host: room.players.find((player) => player.id === room.hostId)?.name ?? "Host",
+    players: room.players.length,
+    maxPlayers: room.settings.maxPlayers,
+    duration: room.settings.duration,
+    chaos: room.settings.chaos,
+    autoStartIn: room.autoStartAt ? Math.max(0, Math.ceil((room.autoStartAt - Date.now()) / 1000)) : null,
   };
 }
 
@@ -98,11 +118,44 @@ function ackError(ack, message) {
   if (typeof ack === "function") ack({ ok: false, error: message });
 }
 
-function attachPlayer(socket, room, name) {
+function createRoom(hostId, settings, isPublic = false) {
+  const room = {
+    code: makeCode(),
+    hostId,
+    players: [],
+    settings,
+    isPublic,
+    phase: "lobby",
+    walls: [],
+    coreHealth: 100,
+    startedAt: 0,
+    lastChaosAt: 0,
+    modifier: null,
+    modifierUntil: 0,
+    coreShieldUntil: 0,
+    autoStartAt: null,
+    autoStartSecond: -1,
+    cleanupTimer: null,
+  };
+  rooms.set(room.code, room);
+  return room;
+}
+
+function bestPublicRoom() {
+  let best = null;
+  for (const room of rooms.values()) {
+    if (!room.isPublic || room.phase !== "lobby") continue;
+    if (room.players.length >= room.settings.maxPlayers) continue;
+    if (!best || room.players.length > best.players.length) best = room;
+  }
+  return best;
+}
+
+function attachPlayer(socket, room, name, ready = null) {
   const player = {
     id: socket.id,
     name,
-    ready: socket.id === room.hostId,
+    ready: ready ?? socket.id === room.hostId,
     role: null,
     score: 0,
     x: WORLD.width / 2,
@@ -148,13 +201,14 @@ function setUpMatch(room) {
   room.phase = "match";
   room.startedAt = Date.now();
   room.lastChaosAt = room.startedAt;
+  room.autoStartAt = null;
   room.modifier = null;
   room.modifierUntil = 0;
   room.coreShieldUntil = 0;
   room.coreHealth = 100;
   room.walls = [];
   const ordered = [...room.players].sort((a, b) => a.id.localeCompare(b.id));
-  const constructorCount = ordered.length / 2;
+  const constructorCount = Math.ceil(ordered.length / 2);
   ordered.forEach((player, index) => {
     player.role = index < constructorCount ? "Constructor" : "Glitcher";
     player.score = 0;
@@ -175,6 +229,7 @@ function finishMatch(room, winner) {
   if (room.phase !== "match") return;
   room.phase = "result";
   room.winner = winner;
+  room.autoStartAt = null;
   io.to(room.code).emit("game:over", {
     winner,
     coreHealth: room.coreHealth,
@@ -183,18 +238,25 @@ function finishMatch(room, winner) {
   publishRoom(room);
   clearTimeout(room.cleanupTimer);
   room.cleanupTimer = setTimeout(() => {
-    if (room.phase === "result") {
-      room.phase = "lobby";
-      room.winner = null;
-      room.players.forEach((player) => {
-        player.role = null;
-        player.ready = player.id === room.hostId;
-        player.score = 0;
-      });
-      publishRoom(room);
-    }
-  }, 20000);
+    if (room.phase === "result") resetToLobby(room);
+  }, RESULT_LINGER);
   room.cleanupTimer.unref?.();
+}
+
+function resetToLobby(room) {
+  clearTimeout(room.cleanupTimer);
+  room.phase = "lobby";
+  room.winner = null;
+  room.autoStartAt = null;
+  room.autoStartSecond = -1;
+  room.walls = [];
+  room.coreHealth = 100;
+  room.players.forEach((player) => {
+    player.role = null;
+    player.ready = room.isPublic ? true : player.id === room.hostId;
+    player.score = 0;
+  });
+  publishRoom(room);
 }
 
 function currentState(room) {
@@ -313,25 +375,30 @@ io.on("connection", (socket) => {
     if (!playerName) return ackError(ack, "Enter a nickname up to 16 characters.");
     if (!roomSettings) return ackError(ack, "Choose valid room settings.");
     removePlayer(socket);
-    const room = {
-      code: makeCode(),
-      hostId: socket.id,
-      players: [],
-      settings: roomSettings,
-      phase: "lobby",
-      walls: [],
-      coreHealth: 100,
-      startedAt: 0,
-      lastChaosAt: 0,
-      modifier: null,
-      modifierUntil: 0,
-      coreShieldUntil: 0,
-      cleanupTimer: null,
-    };
-    rooms.set(room.code, room);
+    const room = createRoom(socket.id, roomSettings);
     attachPlayer(socket, room, playerName);
     if (typeof ack === "function") ack({ ok: true, room: publicRoom(room) });
     publishRoom(room);
+  });
+
+  socket.on("room:quickplay", (payload, ack) => {
+    const playerName = sanitizeName(isRecord(payload) ? payload.name : null);
+    if (!playerName) return ackError(ack, "Enter a nickname up to 16 characters.");
+    removePlayer(socket);
+    const room = bestPublicRoom() ?? createRoom(socket.id, { ...QUICK_PLAY_SETTINGS }, true);
+    attachPlayer(socket, room, playerName, true);
+    if (typeof ack === "function") ack({ ok: true, room: publicRoom(room) });
+    publishRoom(room);
+  });
+
+  socket.on("rooms:list", (_payload, ack) => {
+    if (typeof ack !== "function") return;
+    const open = [...rooms.values()]
+      .filter((room) => room.isPublic && room.phase === "lobby" && room.players.length < room.settings.maxPlayers)
+      .sort((a, b) => b.players.length - a.players.length)
+      .slice(0, 12)
+      .map(lobbySummary);
+    ack({ ok: true, rooms: open, online: io.engine.clientsCount });
   });
 
   socket.on("room:join", (payload, ack) => {
@@ -345,7 +412,7 @@ io.on("connection", (socket) => {
     if (room.phase !== "lobby") return ackError(ack, "That match has already started.");
     if (room.players.length >= room.settings.maxPlayers) return ackError(ack, "That room is full.");
     removePlayer(socket);
-    attachPlayer(socket, room, playerName);
+    attachPlayer(socket, room, playerName, room.isPublic ? true : null);
     if (typeof ack === "function") ack({ ok: true, room: publicRoom(room) });
     publishRoom(room);
   });
@@ -375,7 +442,7 @@ io.on("connection", (socket) => {
     const room = roomFor(socket);
     if (!room || room.phase !== "lobby") return ackError(ack, "There is no open lobby to start.");
     if (room.hostId !== socket.id) return ackError(ack, "Only the room host can start the match.");
-    if (room.players.length < 4 || room.players.length % 2 !== 0) return ackError(ack, "At least four players are required, with equal teams.");
+    if (room.players.length < MIN_MATCH_PLAYERS) return ackError(ack, `At least ${MIN_MATCH_PLAYERS} players are required.`);
     if (room.players.length > room.settings.maxPlayers) return ackError(ack, "The lobby is over its selected player limit.");
     if (room.players.some((player) => !player.ready)) return ackError(ack, "Everyone must ready up before the match starts.");
     setUpMatch(room);
@@ -387,16 +454,8 @@ io.on("connection", (socket) => {
     if (!room || room.phase !== "result" || room.hostId !== socket.id) {
       return ackError(ack, "Only the host can return this room to the lobby.");
     }
-    clearTimeout(room.cleanupTimer);
-    room.phase = "lobby";
-    room.winner = null;
-    room.players.forEach((player) => {
-      player.role = null;
-      player.ready = player.id === room.hostId;
-      player.score = 0;
-    });
+    resetToLobby(room);
     if (typeof ack === "function") ack({ ok: true });
-    publishRoom(room);
   });
 
   socket.on("game:input", (payload) => {
@@ -456,11 +515,38 @@ io.on("connection", (socket) => {
   socket.on("disconnect", () => removePlayer(socket));
 });
 
+function updatePublicRooms(now) {
+  for (const room of rooms.values()) {
+    if (!room.isPublic || room.phase !== "lobby") continue;
+    if (room.players.length < AUTO_START_MIN_PLAYERS) {
+      if (room.autoStartAt) {
+        room.autoStartAt = null;
+        room.autoStartSecond = -1;
+        publishRoom(room);
+      }
+      continue;
+    }
+    if (room.players.length >= room.settings.maxPlayers) {
+      setUpMatch(room);
+      continue;
+    }
+    if (!room.autoStartAt) room.autoStartAt = now + AUTO_START_DELAY;
+    const secondsLeft = Math.max(0, Math.ceil((room.autoStartAt - now) / 1000));
+    if (now >= room.autoStartAt) {
+      setUpMatch(room);
+    } else if (secondsLeft !== room.autoStartSecond) {
+      room.autoStartSecond = secondsLeft;
+      publishRoom(room);
+    }
+  }
+}
+
 setInterval(() => {
   const now = Date.now();
   for (const room of rooms.values()) {
     if (room.phase === "match") stepMatch(room, 100, now);
   }
+  updatePublicRooms(now);
 }, 100).unref();
 
 httpServer.listen(PORT, "0.0.0.0", () => {

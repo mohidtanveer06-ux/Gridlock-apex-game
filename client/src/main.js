@@ -1,16 +1,25 @@
 import { io } from "socket.io-client";
 import { gameAudio } from "./audio.js";
+import { createLocalMatch } from "./local-game.js";
 import "./style.css";
 
 const app = document.querySelector("#app");
 const multiplayerServerUrl = import.meta.env.VITE_SERVER_URL?.trim();
 const vercelFrontend = location.hostname.endsWith(".vercel.app");
+const onlineMultiplayerAvailable = !vercelFrontend || Boolean(multiplayerServerUrl);
 const connection = io(multiplayerServerUrl || undefined, { autoConnect: false, reconnection: true });
 const pendingRoom = new URLSearchParams(location.search).get("room");
 let myName = "";
 let currentRoom = null;
 let arena = null;
+let soloMatch = null;
+let soloSettings = null;
 let startAttempted = false;
+let homePollTimer = null;
+let lastState = null;
+let lastCoreHealth = null;
+let lastScoreKey = "";
+let lobbyKey = "";
 const input = { up: false, down: false, left: false, right: false };
 const directionKeys = {
   w: "up",
@@ -22,6 +31,10 @@ const directionKeys = {
   d: "right",
   ArrowRight: "right",
 };
+
+function ownPlayerId() {
+  return currentRoom?.local ? "solo-player" : connection.id;
+}
 
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, (character) => ({
@@ -65,12 +78,12 @@ function renderIntro() {
       <div class="intro-glow intro-glow-two" aria-hidden="true"></div>
       <div class="intro-brand">
         <div class="brand-mark"><span>MT</span><i></i></div>
-        <div class="brand-kicker">A GRID-BASED TEAM ARENA</div>
+        <div class="brand-kicker">A PLAY-IN-YOUR-BROWSER ARENA</div>
         <h1><span>GRIDLOCK</span><b>APEX</b></h1>
         <p class="brand-studio">MT GRIDLOCK: APEX</p>
         <p class="intro-tagline">BUILD THE GRID. BREAK THE CORE.</p>
-        <button class="button button-primary intro-enter" id="enter-arena"><span>ENTER THE ARENA</span><b>↗</b></button>
-        <div class="intro-foot"><span>ONLINE MULTIPLAYER</span><span>DESKTOP + MOBILE</span><span>NO DOWNLOAD NEEDED</span></div>
+        <button class="button button-primary intro-enter" id="enter-arena"><span>PLAY NOW</span><b>↗</b></button>
+        <div class="intro-foot"><span>SOLO PLAY INCLUDED</span><span>DESKTOP + MOBILE</span><span>NO DOWNLOAD NEEDED</span></div>
       </div>
       <div class="intro-version">APEX / 001</div>
     </main>
@@ -91,6 +104,7 @@ function renderHome() {
     arena.destroy();
     arena = null;
   }
+  stopHomePoll();
   app.innerHTML = `
     <main class="site-shell">
       <header class="topbar">
@@ -101,25 +115,26 @@ function renderHome() {
         <div class="home-copy">
           <div class="eyebrow"><span></span> TWO SIDES. ONE CORE.</div>
           <h1>BUILD TO<br /><em>DEFEND.</em><br />MOVE TO<br /><strong>DESTROY.</strong></h1>
-          <p>Fortify the core as a Constructor. Slip through the grid as a Glitcher. Your crew decides what happens next.</p>
-          <div class="feature-chips"><span>4—8 PLAYERS</span><span>2 MIN MATCHES</span><span>FREE TO PLAY</span></div>
+          <p>Fortify the core as a Constructor. Slip through the grid as a Glitcher. Jump into an online match with real players, or take on the bots solo.</p>
+          <div class="feature-chips"><span>ONLINE MULTIPLAYER</span><span>UP TO 10 PLAYERS</span><span>FREE TO PLAY</span></div>
           <div class="roles-preview">
             <div><i class="role-dot constructor-dot"></i><span><b>CONSTRUCTORS</b><small>BUILD · HOLD · OUTLAST</small></span></div>
             <div><i class="role-dot glitcher-dot"></i><span><b>GLITCHERS</b><small>INFILTRATE · HACK · CORRUPT</small></span></div>
           </div>
         </div>
         <section class="play-card panel">
-          <div class="card-index">01 / CREATE OR JOIN</div>
-          <h2>Find your grid.</h2>
-          <p class="card-subtitle">Jump in as a guest. No account, no download.</p>
+          <div class="card-index">01 / QUICK PLAY</div>
+          <h2>Jump into a match.</h2>
+          <p class="card-subtitle">Quick Match drops you into a live arena with real players and starts on its own.</p>
           <label class="field-label" for="nickname">YOUR CALLSIGN</label>
           <input id="nickname" class="text-input" maxlength="16" autocomplete="nickname" placeholder="e.g. NeonFox" value="Pilot${Math.floor(100 + Math.random() * 900)}" />
-          <div class="divider"><span>CREATE A ROOM</span></div>
-          <div class="settings-row">
-            <label>PLAYERS
-              <select id="max-players" class="select-input">
-                <option value="4">4 players</option><option value="6">6 players</option><option value="8">8 players</option>
-              </select>
+          <button class="button button-primary button-wide" id="quick-match"><span>QUICK MATCH</span><b>↗</b></button>
+          <div class="online-status"><i></i><b id="online-count">CONNECTING…</b></div>
+          <div class="open-rooms" id="open-rooms" aria-live="polite"></div>
+          <div class="divider"><span>SOLO VS BOTS</span></div>
+          <div class="settings-row solo-settings">
+            <label>YOUR ROLE
+              <select id="solo-role" class="select-input"><option value="Glitcher">Glitcher</option><option value="Constructor">Constructor</option></select>
             </label>
             <label>ROUND
               <select id="duration" class="select-input">
@@ -132,13 +147,31 @@ function renderHome() {
               <option value="off">Off</option><option value="chill">Chill · every 90 sec</option><option value="standard" selected>Standard · every 60 sec</option><option value="wild">Wild · every 45 sec</option>
             </select>
           </label>
-          <button class="button button-primary button-wide" id="create-room"><span>CREATE PRIVATE ROOM</span><b>↗</b></button>
-          <div class="divider join-divider"><span>OR JOIN YOUR CREW</span></div>
+          <button class="button button-outline button-wide" id="solo-play"><span>START SOLO MATCH</span><b>↗</b></button>
+          <div class="divider join-divider"><span>PRIVATE ROOM WITH FRIENDS</span></div>
+          <div class="settings-row">
+            <label>PLAYERS
+              <select id="max-players" class="select-input">
+                <option value="4">4 players</option><option value="6">6 players</option><option value="8">8 players</option><option value="10">10 players</option>
+              </select>
+            </label>
+            <label>ROUND LENGTH
+              <select id="online-duration" class="select-input">
+                <option value="90">90 sec</option><option value="120" selected>2 min</option><option value="150">2.5 min</option><option value="180">3 min</option>
+              </select>
+            </label>
+          </div>
+          <label class="field-label chaos-label" for="online-chaos">CHAOS EVENTS
+            <select id="online-chaos" class="select-input">
+              <option value="off">Off</option><option value="chill">Chill · every 90 sec</option><option value="standard" selected>Standard · every 60 sec</option><option value="wild">Wild · every 45 sec</option>
+            </select>
+          </label>
+          <button class="button button-outline button-wide" id="create-room"><span>CREATE PRIVATE ROOM</span><b>↗</b></button>
           <div class="join-row">
             <input id="room-code" class="text-input code-input" maxlength="5" autocapitalize="characters" placeholder="ROOM CODE" />
             <button class="button button-outline" id="join-room">JOIN</button>
           </div>
-          <div class="play-card-foot"><span>PRIVATE ROOMS</span><span>SHARE A LINK</span><span>GUEST READY</span></div>
+          <div class="play-card-foot"><span>GUEST READY</span><span>NO DOWNLOAD</span><span>V 1.0.0</span></div>
         </section>
       </section>
       <footer class="home-footer"><span>MT GRIDLOCK: APEX</span><span>POWERED BY YOUR SQUAD</span><span>V 1.0.0</span></footer>
@@ -147,20 +180,105 @@ function renderHome() {
   `;
   document.querySelector(".wordmark").addEventListener("click", (event) => {
     event.preventDefault();
+    stopHomePoll();
     renderIntro();
   });
   bindSoundControls();
-  document.querySelector("#create-room").addEventListener("click", createRoom);
-  document.querySelector("#join-room").addEventListener("click", joinRoom);
+  document.querySelector("#solo-play").addEventListener("click", startSoloMatch);
+  document.querySelector("#create-room")?.addEventListener("click", createRoom);
+  document.querySelector("#join-room")?.addEventListener("click", joinRoom);
   const codeInput = document.querySelector("#room-code");
-  codeInput.addEventListener("input", () => {
+  codeInput?.addEventListener("input", () => {
     codeInput.value = codeInput.value.toUpperCase().replace(/[^A-Z0-9]/g, "");
   });
   document.querySelector("#nickname").addEventListener("keydown", onSubmitKey);
-  codeInput.addEventListener("keydown", onSubmitKey);
-  if (pendingRoom) {
+  codeInput?.addEventListener("keydown", onSubmitKey);
+  if (onlineMultiplayerAvailable) {
+    document.querySelector("#quick-match").addEventListener("click", quickMatch);
+    startHomeOnline();
+  } else {
+    const offlineNote = `<p class="rooms-empty">Online play is not configured for this link. Solo matches still work — send this link to anyone.</p>`;
+    document.querySelector("#quick-match").disabled = true;
+    document.querySelector("#create-room").disabled = true;
+    document.querySelector("#join-room").disabled = true;
+    document.querySelector("#open-rooms").innerHTML = offlineNote;
+    document.querySelector("#online-count").textContent = "ONLINE PLAY OFFLINE";
+  }
+  if (pendingRoom && onlineMultiplayerAvailable) {
     codeInput.value = pendingRoom.toUpperCase();
     if (myName) joinRoom();
+  }
+}
+
+function stopHomePoll() {
+  clearInterval(homePollTimer);
+  homePollTimer = null;
+}
+
+async function startHomeOnline() {
+  const status = document.querySelector("#online-count");
+  try {
+    await connect();
+  } catch {
+    if (status) status.textContent = "MULTIPLAYER SERVER UNREACHABLE";
+    const rooms = document.querySelector("#open-rooms");
+    if (rooms) rooms.innerHTML = `<p class="rooms-empty">Online play is offline right now. Solo matches still work.</p>`;
+    return;
+  }
+  await refreshRooms();
+  stopHomePoll();
+  homePollTimer = setInterval(refreshRooms, 5000);
+}
+
+async function refreshRooms() {
+  if (!connection.connected || currentRoom || !document.querySelector("#open-rooms")) return;
+  try {
+    const { rooms, online } = await request("rooms:list", {});
+    renderRoomList(rooms, online);
+  } catch {
+    /* keep showing the previous list */
+  }
+}
+
+function renderRoomList(rooms, online) {
+  const count = document.querySelector("#online-count");
+  if (count) count.textContent = `${online} PLAYER${online === 1 ? "" : "S"} ONLINE`;
+  const list = document.querySelector("#open-rooms");
+  if (!list) return;
+  if (!rooms.length) {
+    list.innerHTML = `<p class="rooms-empty">No open matches right now — Quick Match spins up a fresh arena.</p>`;
+    return;
+  }
+  list.innerHTML = `<div class="rooms-title">LIVE ROOMS</div>${rooms.map((room) => `
+    <button type="button" class="room-row" data-code="${room.code}">
+      <span class="room-code">${room.code}</span>
+      <span class="room-meta">${room.players}/${room.maxPlayers} · ${Math.round(room.duration / 60 * 10) / 10} MIN</span>
+      <span class="room-join">${room.autoStartIn != null ? `STARTS ${room.autoStartIn}S` : "JOIN ↗"}</span>
+    </button>`).join("")}`;
+  list.querySelectorAll(".room-row").forEach((row) => {
+    row.addEventListener("click", () => joinRoom(row.dataset.code));
+  });
+}
+
+async function quickMatch() {
+  const name = getName();
+  if (!name) return;
+  const button = document.querySelector("#quick-match");
+  button.disabled = true;
+  button.querySelector("span").textContent = "FINDING MATCH…";
+  try {
+    await connect();
+    const response = await request("room:quickplay", { name });
+    currentRoom = response.room;
+    stopHomePoll();
+    renderLobby();
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    if (button.isConnected) {
+      button.disabled = false;
+      button.querySelector("span").textContent = "QUICK MATCH";
+    }
   }
 }
 
@@ -168,7 +286,7 @@ function onSubmitKey(event) {
   if (event.key === "Enter") {
     event.preventDefault();
     if (event.currentTarget.id === "room-code" && event.currentTarget.value) joinRoom();
-    else createRoom();
+    else startSoloMatch();
   }
 }
 
@@ -182,6 +300,62 @@ function getName() {
   }
   myName = name;
   return name;
+}
+
+async function startSoloMatch() {
+  const name = getName();
+  if (!name) return;
+  await launchSoloMatch({
+    name,
+    role: document.querySelector("#solo-role").value,
+    duration: Number(document.querySelector("#duration").value),
+    chaos: document.querySelector("#chaos").value,
+  });
+}
+
+async function launchSoloMatch(settings) {
+  soloSettings = settings;
+  currentRoom = {
+    local: true,
+    code: "SOLO",
+    hostId: "solo-player",
+    phase: "match",
+    settings: { duration: settings.duration, chaos: settings.chaos },
+    players: [
+      { id: "solo-player", name: settings.name, role: settings.role },
+      { id: "bot-0", name: "Nova", role: settings.role === "Constructor" ? "Glitcher" : "Constructor" },
+      { id: "bot-1", name: "Byte", role: settings.role },
+      { id: "bot-2", name: "Echo", role: settings.role === "Constructor" ? "Glitcher" : "Constructor" },
+    ],
+  };
+  clearInput();
+  await renderArena();
+  soloMatch = createLocalMatch({
+    playerName: settings.name,
+    role: settings.role,
+    duration: settings.duration,
+    chaos: settings.chaos,
+    onState: updateGameUI,
+    onAction: (action, playerId) => {
+      gameAudio.play(action);
+      handleAction(action, playerId);
+    },
+    onAbility: (ability) => {
+      gameAudio.play(ability);
+      if (ability === "shield") {
+        arena?.burstAtCore("shield", 18);
+        arena?.announce("CORE SHIELD ONLINE", "shield");
+      } else {
+        arena?.burstAtPlayer(ownPlayerId(), "glitcher", 18, 260);
+      }
+      showToast(ability === "shield" ? "Core shield online!" : "Phase dash engaged!", "success");
+    },
+    onEvent: (modifier, duration) => {
+      if (modifier === "start") return;
+      announceGameEvent(modifier, duration);
+    },
+    onFinish: showGameOver,
+  });
 }
 
 async function connect() {
@@ -223,8 +397,8 @@ async function createRoom() {
     await connect();
     const settings = {
       maxPlayers: Number(document.querySelector("#max-players").value),
-      duration: Number(document.querySelector("#duration").value),
-      chaos: document.querySelector("#chaos").value,
+      duration: Number(document.querySelector("#online-duration").value),
+      chaos: document.querySelector("#online-chaos").value,
     };
     const response = await request("room:create", { name, settings });
     currentRoom = response.room;
@@ -239,10 +413,10 @@ async function createRoom() {
   }
 }
 
-async function joinRoom() {
+async function joinRoom(explicitCode) {
   const name = getName();
   if (!name) return;
-  const code = document.querySelector("#room-code")?.value.trim().toUpperCase() || pendingRoom?.toUpperCase();
+  const code = (typeof explicitCode === "string" && explicitCode ? explicitCode : document.querySelector("#room-code")?.value.trim() || pendingRoom || "").toUpperCase();
   if (!code) {
     showToast("Enter the five-character room code.");
     return;
@@ -256,6 +430,7 @@ async function joinRoom() {
     await connect();
     const response = await request("room:join", { name, code });
     currentRoom = response.room;
+    stopHomePoll();
     renderLobby();
   } catch (error) {
     showToast(error.message);
@@ -267,10 +442,27 @@ async function joinRoom() {
   }
 }
 
+function lobbySignature(room) {
+  return [
+    room.hostId,
+    room.settings.maxPlayers,
+    room.settings.duration,
+    room.settings.chaos,
+    room.players.map((player) => `${player.id}:${player.ready ? 1 : 0}`).join(","),
+  ].join("#");
+}
+
 function renderLobby() {
+  if (arena) {
+    arena.destroy();
+    arena = null;
+  }
   const isHost = currentRoom.hostId === connection.id;
+  const isPublic = Boolean(currentRoom.isPublic);
   const allReady = currentRoom.players.every((player) => player.ready);
-  const canStart = currentRoom.players.length >= 4 && allReady && currentRoom.players.length % 2 === 0;
+  const canStart = currentRoom.players.length >= 2 && allReady;
+  const countdown = currentRoom.autoStartIn;
+  lobbyKey = lobbySignature(currentRoom);
   const players = Array.from({ length: currentRoom.settings.maxPlayers }, (_, index) => {
     const player = currentRoom.players[index];
     if (!player) return `<div class="player-slot empty"><span class="slot-number">0${index + 1}</span><span class="empty-name">AWAITING PLAYER</span><i></i></div>`;
@@ -278,35 +470,47 @@ function renderLobby() {
     return `<div class="player-slot ${player.ready ? "is-ready" : ""}"><span class="slot-number">0${index + 1}</span><span class="player-avatar">${escapeHtml(player.name.slice(0, 1).toUpperCase())}</span><span class="player-name">${escapeHtml(player.name)}${you ? ' <small>(YOU)</small>' : ""}${player.id === currentRoom.hostId ? ' <b class="host-tag">HOST</b>' : ""}</span><span class="player-status">${player.ready ? "READY" : "NOT READY"}</span></div>`;
   }).join("");
   const chaosNames = { off: "OFF", chill: "CHILL · 90S", standard: "STANDARD · 60S", wild: "WILD · 45S" };
+  const hint = isPublic
+    ? currentRoom.players.length < 3
+      ? `Waiting for players — ${3 - currentRoom.players.length} more to start the countdown.`
+      : countdown != null
+        ? `Match starts automatically in ${countdown} seconds.`
+        : "Countdown starts the moment the lobby fills up."
+    : currentRoom.players.length < 2
+      ? "Need at least one more player to launch."
+      : allReady
+        ? "All players ready. Let the grid begin."
+        : "Everyone needs to ready up before launch.";
   app.innerHTML = `
     <main class="site-shell lobby-shell">
       <header class="topbar">
         <a class="wordmark" href="#"><span class="wordmark-icon">MT</span><span>GRIDLOCK<b>APEX</b></span></a>
-        <div class="topbar-right"><span class="lobby-label">PRIVATE LOBBY</span>${gameAudio.renderControls()}<button class="text-button" id="leave-room">LEAVE ROOM ↗</button></div>
+        <div class="topbar-right"><span class="lobby-label">${isPublic ? "PUBLIC ARENA" : "PRIVATE LOBBY"}</span>${gameAudio.renderControls()}<button class="text-button" id="leave-room">LEAVE ROOM ↗</button></div>
       </header>
       <section class="lobby-layout">
         <div class="lobby-main">
-          <div class="eyebrow"><span></span> SQUAD UP</div>
-          <h1>YOUR GRID.<br /><em>YOUR RULES.</em></h1>
-          <p class="lobby-description">Share the code. Get your crew in. The arena is almost live.</p>
+          <div class="eyebrow"><span></span> ${isPublic ? "MATCHMAKING" : "SQUAD UP"}</div>
+          <h1>${isPublic ? "THE ARENA.<br /><em>FILLING UP.</em>" : "YOUR GRID.<br /><em>YOUR RULES.</em>"}</h1>
+          <p class="lobby-description">${isPublic ? "Real players drop in and the match launches on its own." : "Share the code. Get your crew in. The arena is almost live."}</p>
+          ${countdown != null ? `<div class="auto-start" id="auto-start"><i></i><span>MATCH STARTS IN</span><b id="auto-start-value">${countdown}S</b></div>` : ""}
           <div class="room-share panel">
             <div><small>ROOM CODE</small><strong>${escapeHtml(currentRoom.code)}</strong></div>
             <button class="button button-outline" id="copy-room">COPY INVITE LINK</button>
           </div>
-          <div class="section-heading"><h2>THE CREW <span>${currentRoom.players.length} / ${currentRoom.settings.maxPlayers}</span></h2><div class="team-key"><i class="constructor-dot"></i> CONSTRUCTOR <i class="glitcher-dot"></i> GLITCHER</div></div>
+          <div class="section-heading"><h2>THE CREW <span id="crew-count">${currentRoom.players.length} / ${currentRoom.settings.maxPlayers}</span></h2><div class="team-key"><i class="constructor-dot"></i> CONSTRUCTOR <i class="glitcher-dot"></i> GLITCHER</div></div>
           <div class="player-list">${players}</div>
           <div class="lobby-actions">
-            <button class="button button-outline" id="ready-button">${currentRoom.players.find((player) => player.id === connection.id)?.ready ? "NOT READY" : "READY UP"}</button>
-            ${isHost ? `<button class="button button-primary" id="start-game" ${canStart ? "" : "disabled"}><span>START MATCH</span><b>↗</b></button>` : '<div class="waiting-label"><i></i> WAITING FOR HOST</div>'}
+            ${isPublic ? '<div class="waiting-label"><i></i> AUTO-READY · TEAMS ASSIGNED AT LAUNCH</div>' : `<button class="button button-outline" id="ready-button">${currentRoom.players.find((player) => player.id === connection.id)?.ready ? "NOT READY" : "READY UP"}</button>`}
+            ${isHost ? `<button class="button button-primary" id="start-game" ${canStart ? "" : "disabled"}><span>START MATCH NOW</span><b>↗</b></button>` : '<div class="waiting-label"><i></i> WAITING FOR HOST</div>'}
           </div>
-          <p class="lobby-hint">${currentRoom.players.length < 4 ? `Need ${4 - currentRoom.players.length} more player${currentRoom.players.length === 3 ? "" : "s"} to launch.` : currentRoom.players.length % 2 !== 0 ? "Add one more player to balance the teams." : allReady ? "All players ready. Let the grid begin." : "Everyone needs to ready up before launch."}</p>
+          <p class="lobby-hint" id="lobby-hint">${hint}</p>
         </div>
         <aside class="lobby-side">
           <section class="settings-card panel">
             <div class="card-index">ROOM CONFIGURATION</div><h2>Match settings</h2>
             <label class="field-label" for="lobby-capacity">PLAYER CAPACITY
               <select id="lobby-capacity" class="select-input" ${isHost ? "" : "disabled"}>
-                ${[4, 6, 8].map((count) => `<option value="${count}" ${currentRoom.settings.maxPlayers === count ? "selected" : ""}>${count} players</option>`).join("")}
+                ${[4, 6, 8, 10].map((count) => `<option value="${count}" ${currentRoom.settings.maxPlayers === count ? "selected" : ""}>${count} players</option>`).join("")}
               </select>
             </label>
             <label class="field-label" for="lobby-duration">ROUND LENGTH
@@ -335,11 +539,27 @@ function renderLobby() {
   bindSoundControls();
   document.querySelector("#leave-room").addEventListener("click", leaveRoom);
   document.querySelector("#copy-room").addEventListener("click", copyInvite);
-  document.querySelector("#ready-button").addEventListener("click", toggleReady);
+  document.querySelector("#ready-button")?.addEventListener("click", toggleReady);
   document.querySelector("#start-game")?.addEventListener("click", startGame);
   for (const field of ["#lobby-capacity", "#lobby-duration", "#lobby-chaos"]) {
     document.querySelector(field)?.addEventListener("change", updateSettings);
   }
+}
+
+function syncLobbyLive(room) {
+  const value = document.querySelector("#auto-start-value");
+  if (value && room.autoStartIn != null) value.textContent = `${room.autoStartIn}S`;
+  document.querySelectorAll(".player-slot").forEach((slot, index) => {
+    const player = room.players[index];
+    if (!player) return;
+    slot.classList.toggle("is-ready", Boolean(player.ready));
+    const status = slot.querySelector(".player-status");
+    if (status) status.textContent = player.ready ? "READY" : "NOT READY";
+  });
+  const crew = document.querySelector("#crew-count");
+  if (crew) crew.textContent = `${room.players.length} / ${room.settings.maxPlayers}`;
+  const start = document.querySelector("#start-game");
+  if (start) start.disabled = !(room.players.length >= 2 && room.players.every((player) => player.ready));
 }
 
 async function copyInvite() {
@@ -413,8 +633,15 @@ async function startGame() {
 }
 
 async function leaveRoom() {
+  soloMatch?.stop();
+  soloMatch = null;
+  stopHomePoll();
+  clearFeed();
+  lastState = null;
+  lastCoreHealth = null;
+  lastScoreKey = "";
   try {
-    if (connection.connected) await request("room:leave", {});
+    if (!currentRoom?.local && connection.connected) await request("room:leave", {});
   } catch (error) {
     showToast(error.message);
   }
@@ -427,11 +654,18 @@ async function leaveRoom() {
 }
 
 async function renderArena() {
+  if (arena) {
+    arena.destroy();
+    arena = null;
+  }
+  clearFeed();
+  lastCoreHealth = null;
+  lastScoreKey = "";
   app.innerHTML = `
     <main class="game-shell">
       <header class="game-topbar">
         <a class="wordmark" href="#"><span class="wordmark-icon">MT</span><span>GRIDLOCK<b>APEX</b></span></a>
-        <div class="game-top-center"><span class="match-live"><i></i> MATCH LIVE</span><span class="game-room-code">ROOM ${escapeHtml(currentRoom.code)}</span></div>
+        <div class="game-top-center"><span class="match-live"><i></i> ${currentRoom.local ? "SOLO MATCH" : currentRoom.isPublic ? "PUBLIC MATCH" : "MATCH LIVE"}</span><span class="game-room-code">${currentRoom.local ? "VS BOTS" : `ROOM ${escapeHtml(currentRoom.code)}`}</span></div>
         <div class="game-tools">${gameAudio.renderControls()}<button class="text-button" id="fullscreen-button">FULL SCREEN</button><button class="text-button" id="game-leave">LEAVE MATCH</button></div>
       </header>
       <section class="match-layout">
@@ -440,6 +674,10 @@ async function renderArena() {
           <div class="arena-head"><span class="team-label"><i class="role-dot constructor-dot"></i> CONSTRUCTORS</span><div class="core-status"><span>CORE INTEGRITY</span><strong id="core-value">100%</strong><small id="shield-status"></small></div><span class="team-label glitch-team"><i class="role-dot glitcher-dot"></i> GLITCHERS</span></div>
           <div class="arena-wrap">
             <div id="arena-canvas"></div>
+            <div class="arena-hud" id="arena-hud">
+              <ul class="arena-feed" id="arena-feed" aria-live="polite"></ul>
+              <div class="arena-score" id="arena-score"></div>
+            </div>
             <div class="arena-overlay" id="arena-overlay" aria-live="polite"></div>
           </div>
           <div class="arena-foot"><span>MOVE <b>WASD</b> / <b>↑ ↓ ← →</b></span><span>ACTION <b>E</b></span><span id="modifier-label">NO ACTIVE MODIFIER</span></div>
@@ -465,6 +703,8 @@ async function renderArena() {
   const canvasHost = document.querySelector("#arena-canvas");
   if (!canvasHost || currentRoom?.phase !== "match") return;
   arena = createArena(canvasHost);
+  arena.announce(currentRoom.local ? "MATCH START" : "GRID LIVE");
+  pushFeed("MATCH STARTED — DEFEND OR CORRUPT", "system");
   bindSoundControls();
   document.querySelector("#game-leave").addEventListener("click", leaveRoom);
   document.querySelector("#ability-button").addEventListener("click", useAbility);
@@ -506,19 +746,26 @@ function updateFullscreenButton() {
 }
 
 function updateGameUI(state) {
-  const own = state.players.find((player) => player.id === connection.id);
+  const own = state.players.find((player) => player.id === ownPlayerId());
   const seconds = state.timeRemaining;
   const timer = document.querySelector("#match-timer");
   if (!timer) return;
+  lastState = state;
   timer.textContent = `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
   timer.classList.toggle("timer-danger", seconds <= 20);
   document.querySelector("#core-value").textContent = `${state.coreHealth}%`;
   const coreStatus = document.querySelector(".core-status");
   coreStatus.style.setProperty("--health", `${state.coreHealth}%`);
   coreStatus.classList.toggle("core-shielded", state.coreShieldRemaining > 0);
+  coreStatus.classList.toggle("core-critical", state.coreHealth <= 30);
   document.querySelector("#shield-status").textContent = state.coreShieldRemaining > 0
     ? `SHIELDED · ${state.coreShieldRemaining}S`
     : "";
+  if (lastCoreHealth !== null && state.coreHealth < lastCoreHealth && arena) {
+    arena.flash("danger", 140);
+    arena.shake(0.005 + Math.min(0.013, (lastCoreHealth - state.coreHealth) / 420), 200);
+  }
+  lastCoreHealth = state.coreHealth;
   const modifierText = {
     gravity: `GRAVITY FLIP · ${state.modifierRemaining}S`,
     darkness: `TOTAL DARKNESS · ${state.modifierRemaining}S`,
@@ -547,22 +794,78 @@ function updateGameUI(state) {
     touchAbility.classList.toggle("ability-glitcher", own.role === "Glitcher");
   }
   document.querySelector("#players-mini").innerHTML = state.players.map((player) =>
-    `<span class="mini-player ${player.role === "Glitcher" ? "mini-glitcher" : ""} ${player.id === connection.id ? "mini-own" : ""}" title="${escapeHtml(player.name)}">${escapeHtml(player.name.slice(0, 1).toUpperCase())}</span>`,
+    `<span class="mini-player ${player.role === "Glitcher" ? "mini-glitcher" : ""} ${player.id === ownPlayerId() ? "mini-own" : ""}" title="${escapeHtml(player.name)} (${player.score} pts)">${escapeHtml(player.name.slice(0, 1).toUpperCase())}</span>`,
   ).join("");
-  if (arena) arena.setSnapshot({ ...state, ownId: connection.id });
+  updateScoreboard(state);
+  if (arena) arena.setSnapshot({ ...state, ownId: ownPlayerId() });
   const shell = document.querySelector(".game-shell");
   shell.classList.toggle("modifier-gravity", state.modifier === "gravity");
   shell.classList.toggle("modifier-darkness", state.modifier === "darkness");
   shell.classList.toggle("modifier-surge", state.modifier === "surge");
 }
 
+function updateScoreboard(state) {
+  const constructorScore = state.players.reduce((total, player) => total + (player.role === "Constructor" ? player.score : 0), 0);
+  const glitcherScore = state.players.reduce((total, player) => total + (player.role === "Glitcher" ? player.score : 0), 0);
+  const key = `${constructorScore}:${glitcherScore}`;
+  if (key === lastScoreKey) return;
+  lastScoreKey = key;
+  const host = document.querySelector("#arena-score");
+  if (!host) return;
+  host.innerHTML = `
+    <span class="score-chip score-constructor"><i>CON</i><b>${constructorScore}</b></span>
+    <span class="score-chip score-glitcher"><i>GLT</i><b>${glitcherScore}</b></span>`;
+}
+
+function clearFeed() {
+  const feed = document.querySelector("#arena-feed");
+  if (feed) feed.innerHTML = "";
+}
+
+function pushFeed(text, kind = "system") {
+  const feed = document.querySelector("#arena-feed");
+  if (!feed) return;
+  const item = document.createElement("li");
+  item.className = `feed-item feed-${kind}`;
+  item.textContent = text;
+  feed.prepend(item);
+  while (feed.children.length > 4) feed.lastElementChild.remove();
+  setTimeout(() => item.classList.add("feed-fade"), 3000);
+  setTimeout(() => item.remove(), 3800);
+}
+
+function playerName(playerId) {
+  if (playerId === ownPlayerId() && myName) return myName.toUpperCase();
+  const player = lastState?.players.find((entry) => entry.id === playerId) ?? currentRoom?.players.find((entry) => entry.id === playerId);
+  return (player?.name ?? "A PLAYER").toUpperCase();
+}
+
+function handleAction(action, playerId) {
+  if (action === "build") {
+    pushFeed(`${playerName(playerId)} FORTIFIED A CELL`, "build");
+    arena?.burstAtPlayer(playerId, "amber", 10, 150);
+  } else if (action === "break") {
+    pushFeed(`${playerName(playerId)} BREACHED A BARRIER`, "break");
+    arena?.burstAtPlayer(playerId, "amber", 14, 210);
+  } else if (action === "hack") {
+    pushFeed(`${playerName(playerId)} HACKED THE CORE −8`, "hack");
+    arena?.burstAtCore("glitcher", 26);
+  }
+}
+
 function doAction() {
-  if (connection.connected && currentRoom?.phase === "match") {
+  if (currentRoom?.local && currentRoom.phase === "match") {
+    soloMatch?.action();
+  } else if (connection.connected && currentRoom?.phase === "match") {
     connection.emit("game:action");
   }
 }
 
 async function useAbility() {
+  if (currentRoom?.local && currentRoom.phase === "match") {
+    soloMatch?.ability();
+    return;
+  }
   if (!connection.connected || currentRoom?.phase !== "match") return;
   try {
     await request("game:ability", {});
@@ -601,7 +904,8 @@ function installInputHandlers() {
     if (document.hidden) clearInput();
   });
   setInterval(() => {
-    if (connection.connected && currentRoom?.phase === "match") connection.emit("game:input", input);
+    if (currentRoom?.local && currentRoom.phase === "match") soloMatch?.input(input);
+    else if (connection.connected && currentRoom?.phase === "match") connection.emit("game:input", input);
   }, 50);
 }
 
@@ -620,7 +924,8 @@ connection.on("room:update", (room) => {
       startAttempted = false;
       renderLobby();
     } else if (document.querySelector(".lobby-shell")) {
-      renderLobby();
+      if (lobbySignature(room) === lobbyKey) syncLobbyLive(room);
+      else renderLobby();
     }
   }
 });
@@ -630,29 +935,75 @@ connection.on("game:state", (state) => {
 });
 
 connection.on("game:event", ({ modifier, duration }) => {
+  announceGameEvent(modifier, duration);
+});
+
+function announceGameEvent(modifier, duration) {
   const messages = {
-    gravity: "GRAVITY FLIP — controls reversed!",
-    darkness: "TOTAL DARKNESS — keep your bearings.",
-    surge: "SPEED SURGE — move fast!",
+    gravity: "GRAVITY FLIP — CONTROLS REVERSED",
+    darkness: "TOTAL DARKNESS",
+    surge: "SPEED SURGE",
   };
   gameAudio.play("chaos");
+  pushFeed(`${messages[modifier] || "CHAOS EVENT"} · ${duration}S`, "chaos");
+  arena?.announce(messages[modifier] || "CHAOS EVENT", "amber");
+  arena?.flash("amber", 220);
   const toast = document.querySelector("#event-toast");
   if (!toast) return;
-  toast.textContent = messages[modifier] || "CHAOS EVENT";
+  toast.textContent = `${messages[modifier] || "CHAOS EVENT"} — HOLD THE LINE`;
   toast.classList.add("event-visible");
   clearTimeout(connection.eventTimer);
   connection.eventTimer = setTimeout(() => toast.classList.remove("event-visible"), duration * 1000);
-});
+}
 
 connection.on("game:over", ({ winner, coreHealth, results }) => {
+  showGameOver({ winner, coreHealth, results });
+});
+
+function showGameOver({ winner, coreHealth, results }) {
   clearInput();
+  if (currentRoom?.local) {
+    currentRoom.phase = "result";
+    soloMatch?.stop();
+  }
   gameAudio.play("victory");
-  const own = currentRoom?.players.find((player) => player.id === connection.id);
-  const won = own?.role === winner.slice(0, -1) || (winner === "Constructors" && own?.role === "Constructor") || (winner === "Glitchers" && own?.role === "Glitcher");
-  const details = results.map((result) => `<div class="result-row"><span class="result-role ${result.role === "Glitcher" ? "result-glitcher" : ""}">${escapeHtml(result.role)}</span><b>${escapeHtml(result.name)}</b><span>${result.score} PTS</span></div>`).join("");
+  const own = currentRoom?.players.find((player) => player.id === ownPlayerId());
+  const won = Boolean(own?.role && winner === `${own.role}s`);
+  arena?.announce(`${winner.toUpperCase()} WIN`, won ? "constructor" : "glitcher");
+  pushFeed(`MATCH OVER — ${winner.toUpperCase()} WIN`, "system");
+  const details = results
+    .slice()
+    .sort((a, b) => b.score - a.score)
+    .map((result, index) => `<div class="result-row"><span class="result-rank">#${index + 1}</span><span class="result-role ${result.role === "Glitcher" ? "result-glitcher" : ""}">${escapeHtml(result.role)}</span><b>${escapeHtml(result.name)}</b><span>${result.score} PTS</span></div>`)
+    .join("");
   const overlay = document.querySelector("#arena-overlay");
   if (!overlay) return;
-  overlay.innerHTML = `<section class="result-card panel"><div class="eyebrow"><span></span> MATCH COMPLETE</div><h2>${won ? "GRID SECURED." : "GRID CORRUPTED."}</h2><p class="result-summary"><b>${escapeHtml(winner)} win</b> · Core integrity ${coreHealth}%</p><div class="result-list">${details}</div>${currentRoom?.hostId === connection.id ? '<button class="button button-primary button-wide" id="return-lobby"><span>RETURN TO LOBBY</span><b>↗</b></button>' : '<p class="result-wait">Waiting for the host to reset the room…</p>'}</section>`;
+  const onlineActions = currentRoom?.isPublic
+    ? '<div class="result-actions"><button class="button button-primary" id="result-play-again">PLAY AGAIN</button><button class="button button-outline" id="result-home">HOME</button></div>'
+    : currentRoom?.hostId === connection.id
+      ? '<div class="result-actions"><button class="button button-primary" id="return-lobby">RETURN TO LOBBY</button><button class="button button-outline" id="result-home">HOME</button></div>'
+      : '<p class="result-wait">Waiting for the host to reset the room…</p>';
+  overlay.innerHTML = `<section class="result-card panel"><div class="eyebrow"><span></span> MATCH COMPLETE</div><h2>${won ? "VICTORY." : "DEFEAT."}</h2><p class="result-summary"><b>${escapeHtml(winner)} win</b> · Core integrity ${coreHealth}%</p><div class="result-list">${details}</div>${currentRoom?.local ? '<div class="result-actions"><button class="button button-primary" id="solo-replay">PLAY AGAIN</button><button class="button button-outline" id="solo-home">HOME</button></div>' : onlineActions}</section>`;
+  document.querySelector("#solo-replay")?.addEventListener("click", () => {
+    const settings = soloSettings;
+    soloMatch?.stop();
+    soloMatch = null;
+    launchSoloMatch(settings);
+  });
+  document.querySelector("#solo-home")?.addEventListener("click", leaveRoom);
+  document.querySelector("#result-home")?.addEventListener("click", leaveRoom);
+  document.querySelector("#result-play-again")?.addEventListener("click", async () => {
+    const name = myName || getName();
+    if (!name) return;
+    try {
+      await request("room:leave", {});
+      const response = await request("room:quickplay", { name });
+      currentRoom = response.room;
+      renderLobby();
+    } catch (error) {
+      showToast(error.message);
+    }
+  });
   document.querySelector("#return-lobby")?.addEventListener("click", async () => {
     try {
       await request("room:return", {});
@@ -660,17 +1011,25 @@ connection.on("game:over", ({ winner, coreHealth, results }) => {
       showToast(error.message);
     }
   });
-});
+}
 
 connection.on("game:ability", ({ playerId, ability }) => {
   gameAudio.play(ability);
-  if (playerId === connection.id) {
+  if (ability === "shield") {
+    arena?.burstAtCore("shield", 18);
+    arena?.announce("CORE SHIELDED", "shield");
+    pushFeed(`${playerName(playerId)} SHIELDED THE CORE`, "shield");
+  } else {
+    arena?.burstAtPlayer(playerId, "glitcher", 14, 240);
+  }
+  if (playerId === ownPlayerId()) {
     showToast(ability === "shield" ? "Core shield online!" : "Phase dash engaged!", "success");
   }
 });
 
-connection.on("game:action", ({ action }) => {
+connection.on("game:action", ({ playerId, action }) => {
   gameAudio.play(action);
+  handleAction(action, playerId);
 });
 
 connection.on("connect_error", () => {
@@ -702,7 +1061,7 @@ renderIntro();
 installInputHandlers();
 
 document.addEventListener("click", (event) => {
-  if (event.target?.id === "enter-arena" && pendingRoom) {
+  if (event.target?.id === "enter-arena" && pendingRoom && onlineMultiplayerAvailable) {
     setTimeout(() => {
       const nameField = document.querySelector("#nickname");
       if (nameField?.value.trim()) joinRoom();
