@@ -220,7 +220,6 @@ function renderHome() {
   }
   if (pendingRoom && onlineMultiplayerAvailable) {
     codeInput.value = pendingRoom.toUpperCase();
-    if (myName) joinRoom();
   }
 }
 
@@ -237,6 +236,10 @@ async function startHomeOnline() {
     if (status) status.textContent = "MULTIPLAYER SERVER UNREACHABLE";
     const rooms = document.querySelector("#open-rooms");
     if (rooms) rooms.innerHTML = `<p class="rooms-empty">Online play is offline right now. Solo matches still work.</p>`;
+    return;
+  }
+  if (pendingRoom) {
+    joinRoom(pendingRoom);
     return;
   }
   await refreshRooms();
@@ -1073,12 +1076,3 @@ connection.on("connect", () => {
 
 renderIntro();
 installInputHandlers();
-
-document.addEventListener("click", (event) => {
-  if (event.target?.id === "enter-arena" && pendingRoom && onlineMultiplayerAvailable) {
-    setTimeout(() => {
-      const nameField = document.querySelector("#nickname");
-      if (nameField?.value.trim()) joinRoom();
-    }, 0);
-  }
-});

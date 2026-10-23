@@ -11,10 +11,17 @@ const allowedOrigins = (process.env.CLIENT_ORIGIN || "http://localhost:5173")
   .split(",")
   .map((origin) => origin.trim())
   .filter(Boolean);
+// Vercel gives every project a production domain plus per-branch preview domains,
+// so allowlisting a single production URL breaks multiplayer on preview builds.
+const vercelOrigin = /^https:\/\/[a-z0-9-]+(?:-[a-z0-9-]+)*\.vercel\.app$/i;
+function originAllowed(origin) {
+  if (!origin) return true;
+  return allowedOrigins.includes(origin) || vercelOrigin.test(origin);
+}
 const io = new Server(httpServer, {
   cors: {
     origin(origin, callback) {
-      callback(null, !origin || allowedOrigins.includes(origin));
+      callback(null, originAllowed(origin));
     },
   },
   pingInterval: 25000,
