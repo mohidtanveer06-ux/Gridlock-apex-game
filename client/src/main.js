@@ -197,12 +197,26 @@ function renderHome() {
     document.querySelector("#quick-match").addEventListener("click", quickMatch);
     startHomeOnline();
   } else {
-    const offlineNote = `<p class="rooms-empty">Online play is not configured for this link. Solo matches still work — send this link to anyone.</p>`;
+    const statusEl = document.querySelector("#online-count");
+    if (statusEl) {
+      statusEl.textContent = "SERVER URL MISSING";
+      statusEl.style.color = "var(--pink)";
+    }
+    const roomsEl = document.querySelector("#open-rooms");
+    if (roomsEl) {
+      roomsEl.innerHTML = `
+        <div class="rooms-empty">
+          <strong>Multiplayer requires a persistent server.</strong><br/>
+          Vercel is only hosting the frontend. You need to:<br/>
+          1. Deploy the <code>server/</code> folder to <strong>Render</strong> or <strong>Railway</strong>.<br/>
+          2. Add <code>VITE_SERVER_URL</code> to Vercel Settings.<br/>
+          3. Add <code>CLIENT_ORIGIN</code> to your server settings.
+        </div>
+      `;
+    }
     document.querySelector("#quick-match").disabled = true;
     document.querySelector("#create-room").disabled = true;
     document.querySelector("#join-room").disabled = true;
-    document.querySelector("#open-rooms").innerHTML = offlineNote;
-    document.querySelector("#online-count").textContent = "ONLINE PLAY OFFLINE";
   }
   if (pendingRoom && onlineMultiplayerAvailable) {
     codeInput.value = pendingRoom.toUpperCase();
